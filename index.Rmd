@@ -1,0 +1,352 @@
+---
+title: "Final Project"
+author: "Denis Pisarenko"
+date: "2022-10-19"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Analysis of the Jeopardy dataset
+
+In this project, I am working with the Jeopardy dataset. "Jeopardy!" is an American TV-game where the participants answer the questions from different categories (like "Sports", "European capitals", "Animals") earning scores for correct answers and losing them if their answer is incorrect. This show has become world famous; local versions of Jeopardy were created in different countries (in Russia, it is known as "Svoya igra").
+
+The dataset contains the data for (probably) every question ever asked in jeopardy since 1984/10/9 till 2012/1/27. Unsurpisingly, it is really large: overall, it contains 216930 rows. The seven columns stand for different parameters of a particular question. There are:
+
+* Show.Number -- the number of the series episode
+* Air.Date -- the date when the episode was released
+* Round -- the type of round during which the question was asked. The value of the question depends on the round. There are four types of rounds: Jeopardy! (ordinary questions, base value), Double Jeopardy! (doubled value),  Final Jeopardy! (questions asked in the final round, no fixed value), and Tiebreaker (extremely rare, no fixed value).
+* Category -- a field of knowledge the question belongs to ("History", "The human body", etc).
+* Value -- a value of question.
+* Question -- the text of the question. Example: "For the last 8 years of his life, Galileo was under house arrest for espousing this man's theory" (History, $200).
+* Answer -- the correct answer ("Copernicus").
+
+```{r}
+#introducing all the necessary libraries first
+library(tidyverse)
+library(stringr)
+library(tidytext)
+library(stopwords)
+library(textstem)
+library(ggrepel)
+
+jeopardy <- read_csv('https://raw.githubusercontent.com/denisyurievichpisarenko/jeo_project/main/jeopardy_data.csv')
+head(jeopardy)
+```
+
+## Hypothesis
+
+My primary interest is to find out how Category and Value are related to other properties of a question. I would assume that more valuable questions will differ in some text properties from the less valuable ones. I also expect the text of questions and the linguistic features of answers to show some inter-categorical variability.
+
+The hypotheses I come up with are the following:
+
+* I expect that the distribution of proper names in answers will vary from category to category (it seems quite obvious that such answers will prevail in, say, "State capitals" category, but what will we expect for "Sports" or "American history"?)
+* I also assume that answers containing proper names will be in general more valuable: it might be more difficult to remember a certain name or a toponym than some commonly used word.
+* I predict that more valuable questions will contain less frequent words (respectively to the whole corpus of questions)
+
+SO, let's test them! But firstly, it is necessary to clean the data.
+
+## Data preparation
+
+The biggest problem of the Jeopardy dataset is its size. operating on 200.000+ rows is a bit difficult so I will work with its smaller part.
+
+What are the conditions I will use to reduce the amount of data? First of all, I propose to filter it based on Round column. Value is one of the key features important for the survey, so values must be unified across all the dataframe. However, "Double Jeopardy!" may provide ordinary questions with doubled value while "Final Jeopardy!" and "Tiebreaker" have no values at all. I will filter the data to leave only the questions from "Jeopardy!" round.
+
+
+```{r}
+jeo <- filter(jeopardy, Round == "Jeopardy!")
+print(nrow(jeo))
+```
+
+The dataframe is still quite huge; I consider a better option to operate only with the most popular values and most popular categories. 
+
+
+```{r}
+jeo %>% group_by(Value) %>% summarise('Count_Value' = n()) -> jeo_vals
+jeo %>% group_by(Category) %>% summarise('Count_Categories' = n()) -> jeo_themes
+
+#present the top 10 values and top 20 categories
+head(jeo_vals[order(jeo_vals$Count_Value, decreasing = TRUE), ], n = 10)
+head(jeo_themes[order(jeo_themes$Count_Categories, decreasing = TRUE), ], n = 20)
+```
+A clear distinction is seen in the value dataframe: all values from top-8 may be considered popular. '1,000' is a variation of '1000' so it also will be added to the dataframe. No such a distinction is seen among the top categories, so I (quite randomly) decided to use top 20 of them.
+
+
+```{r}
+jeo_themes%>%
+  slice_max(Count_Categories, n=20) -> popular_themes
+
+#slicing the top 20 themes
+jeo %>%
+  right_join(popular_themes, by='Category') -> jeo
+
+#slicing the top 20 values
+jeo <- jeo[jeo$Value %in% c('$100', '$200', '$300', '$400', '$500', '$600', '$800', '$1000', '$1,000'), ]
+
+#renaming 1,000 to 1000
+jeo$Value <- sub("1,000", "1000", jeo$Value)
+```
+
+Great! Now we have a nice 4081-row dataframe. As a final preparation, I will remove the tabulation signs from the Answer column.
+
+```{r}
+#at first it was like...
+print(jeo$Answer[1])
+
+jeo$Answer <- sub("\t\t\t\t\t\t\t\t\t", "", jeo$Answer)
+
+#...then it became like this
+print(jeo$Answer[1])
+```
+Let's analyse our data.
+
+## Analysis
+
+### The analysis of frequency
+
+According to my hypothesis, more expensive questions must contain words that are less frequent in the whole corpus. To prove it, I need to build a corpus. The function "preprocess" I introduce below splits the strings into separate words, then strips each word from the odd symbols and lemmatizes it.
+
+```{r}
+preprocess <- function(x){
+  v <- c() #empty vector
+  x <- str_remove_all(x, "[><)(/,':;!?&.]") #stripping the Question string
+  for(word in lemmatize_words(tolower(scan(text = x, what = '')))){ #for lemmatized word in splitted Question string
+    if(!(word %in% stopwords("en"))){ #we don't want to include extremely popular semantically poor words (like "it", "have", "his" etc, so the stopwords are removed)
+      v <- append(v, word) #adding the word to the introduced vector
+    }
+  }
+  return(v)
+}
+
+#Now let's lemmatize our questions. The result will be assigned to the new Lemma column
+jeo$Lemma <- lapply(jeo$Question, preprocess)
+```
+
+Now for each question there is a vector with its lemmatized words. What if to make corpus of this? 
+
+```{r}
+bag <- c() #empty vector
+for(vec in jeo$Lemma){ #for each vactor of lemmas
+  for(el in vec){ #for each lemma
+    bag <- append(bag, el) #append lemma to the empty vector
+  }
+}
+
+freqs <- as.data.frame(table(bag)) #the table which shows the number of occurences of each word
+freqs$frequency <- freqs$Freq/length(bag) #a new column which shows the frequency of each word (with respect to the whole amount of corpus)
+
+head(freqs[order(freqs$frequency, decreasing = TRUE), ], n = 10)
+```
+
+We can see that "name" is a very popular word: a 1% of corpus!
+
+Now it is possible to compute an average frequency of a word for each question. Since the frequency values are usually very little and hence inconvenient, I would logarithm them (so, -10 will be assigned to the questions with the least frequent words, -6 will correspond to more frequent ones).
+
+```{r}
+sum_freq <- function(x){
+  summa <- 0 #initializing a number variable
+  for(w in x[[1]]){ #for lemma in a vector of lemmas
+    summa <- summa + freqs[freqs$bag == w, ]$frequency #sum of frequencies of all words of a given question
+  }
+  ratio <- summa/length(x[[1]]) #average frequency
+  l <- log(ratio) #logarithm of average frequency
+  return(l)
+}
+
+jeo$Sum_freq <- as.numeric(lapply(jeo$Lemma, sum_freq))
+```
+
+Now we can draw a plot!
+
+The following boxplot shows the distribution of average frequency of items in question across different Values. For clarity, I provide the same data as a violin plot.
+
+```{r}
+jeo %>%
+  arrange(Sum_freq) %>%
+  mutate(Value = factor(Value, levels=c("$100", "$200", "$300", "$400", "$500", "$600", "$800", "$1000")))%>% #arranging the correct order
+  ggplot(aes(x=Value, y=Sum_freq))+
+  geom_boxplot(fill='green', color="red")+
+  labs(x = "Value of question",
+       y = "Average frequency of items in a question",
+       title = "Average frequency of a word in a question dependent on its value",
+       caption = "data from 
+       https://www.reddit.com/r/datasets/comments/1uyd0t/200000_jeopardy_questions_in_a_json_file/")+
+  theme_bw()
+
+jeo %>%
+  arrange(Sum_freq) %>%
+  mutate(Value = factor(Value, levels=c("$100", "$200", "$300", "$400", "$500", "$600", "$800", "$1000")))%>% 
+  ggplot(aes(x=Value, y=Sum_freq))+
+  geom_violin(fill="purple")+
+  labs(x = "Value of question",
+       y = "Average frequency of items in a question",
+       title = "Average frequency of a word in a question dependent on its value",
+       caption = "data from 
+       https://www.reddit.com/r/datasets/comments/1uyd0t/200000_jeopardy_questions_in_a_json_file/")+
+  theme_bw()
+```
+
+As can be seen from both plots, the statistical significance barely can be seen in this distribution. Boxes overlap sharing the same intervals. For all of the Values, the median of average frequency of a word is about  e ^ (-8.25).
+
+Maybe we can obtain different results if take Category but not Value as x? As the boxplot below shows, the  correlation seems more tangible but still far from being statistically significant.
+
+```{r}
+jeo %>%
+  ggplot(aes(x=Category, y=Sum_freq))+
+  geom_boxplot(fill='yellow', color="brown")+
+  coord_flip()+
+  labs(x = "Category",
+       y = "Average frequency of items in a question",
+       title = "Average frequency of a word in a question dependent on its category",
+       caption = "data from 
+       https://www.reddit.com/r/datasets/comments/1uyd0t/200000_jeopardy_questions_in_a_json_file/")+
+  theme_bw()
+```
+
+Let's turn to the second hypothesis: how the number of proper names in answers is related to Value and Category?
+
+### Analysis of answers
+
+First thing to do is to detect whether the particular answer has a proper name inside it. The "find_capital" function splits (if necessary) the answer into words and then checks if at least one word starts with capital letter. I applied this function to the dataframe, now it has a column telling whether the answer has a proper name inside it
+
+```{r}
+find_capital <- function(x){
+  xs <- scan(text = x, what = '') #splitting the Answer string
+  ans <- FALSE #initializing the bool variable
+  for(w in xs){ #for a separate word in answer
+    if(substr(w, 1, 1) != tolower(substr(w, 1, 1))){ #if the first letter is not the same as its lowered variant...
+      ans <- TRUE #...then return TRUE, else variable doesn't change (returning FALSE)
+    }
+  }
+  return(ans)
+}
+
+#creating a new column telling does the answer has a proper name inside
+jeo$IsProper <- lapply(jeo$Answer, find_capital)
+
+#checking how it works
+print(jeo$Answer[1])
+print(jeo$IsProper[1])
+print(jeo$Answer[7])
+print(jeo$IsProper[7])
+```
+
+We need to create the subset containing only the answers with proper names.
+
+```{r}
+jeo_true <- jeo[jeo$IsProper == TRUE, ]
+```
+
+Then, let's find a proportion of proper answers for each category
+
+```{r}
+#number of proper answers for each category
+jeo_true%>%
+  group_by(Category, Value)%>%
+  summarize('Count_true' = n()) -> jeo_true_vals
+
+#number of answers for each category
+jeo%>%
+  group_by(Category, Value)%>%
+  summarize('Count_gen' = n()) -> jeo_gen
+
+#proportion of proper answers for each category (assigned to Ratio column)
+jeo_gen %>% left_join(jeo_true_vals, by = c('Category', 'Value')) -> jeom
+jeom[is.na(jeom)] <- 0 #replacing NAs with 0
+jeom$Ratio <- jeom$Count_true/jeom$Count_gen
+```
+
+Using the heatmap, we can see how the proportion of proper answers is dependent on category and value of the question. Unsurprisingly, the highest proportion of proper names in answers reaching 1.00 almost for all values is observed for the categories related to geography ("State capitals", "US geography" etc). Some categories, like "Stars", "Television" or "American hictory" might have a big proportion of proper answers since the questions in them often require to name a certain person.
+
+Several categories including "Animals", "Science", "3-letter words" and "Common bonds" show a big drop of proportion of proper names after the value of $600. This contradicts one of my hypotheses: it might turn out that a complex question will more likely contain a common noun than a proper one.
+       
+```{r}
+jeom%>%
+  arrange(Category) %>%
+  mutate(Value = factor(Value, levels=c("$100", "$200", "$300", "$400", "$500", "$600", "$800", "$1000")))%>%
+  ggplot(aes(x = Value, y = Category, fill = Ratio))+
+  geom_tile()+
+  labs(x = "Value",
+       y = "Category",
+       title = "Number of proper names in dependence of value and category",
+       caption = "data from 
+       https://www.reddit.com/r/datasets/comments/1uyd0t/200000_jeopardy_questions_in_a_json_file/")
+```
+
+It would be useful to plot the average proportion of proper answers for each category and value. The column plot for values reflects an interesting distribution: it can be clearly divided on two parts: the low-valued questions (500 dol. and less) often have a proper answer, the high-valued questions (more than 500 dol.) have proper answers much rarer. Nevertheless, inside these groups (of low- and high-valued questions) the proportions are distributed quite randomly: the most frequent value for questions with proper names is not 100 or 200 but 500 dol, for example 
+       
+```{r}
+jeom %>% group_by(Category) %>% summarise(mean(Ratio)) %>% rename('Mean_ratio' = 'mean(Ratio)') -> jeon
+jeom %>% group_by(Value) %>% summarise(mean(Ratio)) %>% rename('Mean_ratio' = 'mean(Ratio)') -> jeop
+
+jeon%>%
+  ggplot(aes(reorder(Category, Mean_ratio), Mean_ratio))+
+  geom_col(fill = 'dark green')+
+  coord_flip()+
+  labs(x = "Category",
+       y = "",
+       title = "Average proportion of proper answers",
+       caption = "data from 
+       https://www.reddit.com/r/datasets/comments/1uyd0t/200000_jeopardy_questions_in_a_json_file/")+
+  theme_bw() 
+
+jeop%>%
+  ggplot(aes(reorder(Value, Mean_ratio), Mean_ratio))+
+  geom_col(fill = 'dark blue')+
+  coord_flip()+
+  labs(x = "Value of question",
+       y = "",
+       title = "Average proportion of proper answers",
+       caption = "data from 
+       https://www.reddit.com/r/datasets/comments/1uyd0t/200000_jeopardy_questions_in_a_json_file/")+
+  theme_bw()
+```
+
+The plot below shows deals only with the questions with proper answers.It shows how the questions of each value are distributed inside each category. Everywhere except "Stupid answers" the number of proper answers decreases from little values to greater ones.
+
+```{r}
+jeo_true%>%
+  arrange(Category) %>%
+  mutate(Value = factor(Value, levels=c("$100", "$200", "$300", "$400", "$500", "$600", "$800", "$1000")))%>%
+  ggplot(aes(fct_rev(fct_infreq(Category)), fill=Value))+
+  geom_bar()+
+  coord_flip()+
+  labs(x = "Category",
+       title = "How many proper answers of each value are in different categories?",
+       caption = "data from 
+       https://www.reddit.com/r/datasets/comments/1uyd0t/200000_jeopardy_questions_in_a_json_file/")
+```
+
+## Concluding remarks
+
+We had a look on two variables which may be obtained from this data: the proportion of proper answers across categories and the average frequency of a word in a question. The second variable turned out to be insignificant: the average frequency/rariety of words you use in a question does not matter in computing the complexity of the question. The proportion of proper names in answer is related to the category the question belongs to and its value as well. However, conversely to my predictions, proper answers are more often being assigned to the less valuable question. The distribution across categories is much more predictable: proper names are common (*no pun intended*) in the geography, history and show buisness related categories.
+
+The final question which may be asked is... Do these two variables correlate between each other?
+
+```{r}
+jeo %>% group_by(Category) %>% summarise(Med_freq = mean(Sum_freq)) -> jeor
+jeos <- merge(jeon, jeor, by = 'Category')
+
+jeos%>%
+  ggplot(aes(Med_freq, Mean_ratio))+
+  geom_point()+
+  labs(x = "Average frequency of words in questions",
+       y = "Proportion of proper names in answers",
+       title = "Frequency of words and proper names across Jeopardy's categories",
+       caption = "data from 
+       https://www.reddit.com/r/datasets/comments/1uyd0t/200000_jeopardy_questions_in_a_json_file/")+
+  geom_text_repel(aes(label = Category), size = 3.4, max.overlaps = Inf)+ #size is choosen quite randomly: I tried to fit it but finally gave up :(
+  theme_bw()
+```
+
+The scatterplot above shows that we have a claster of categories in our data: the majority of categories have average rate of word frequency and a big proportion of proper names. Another possibly distinguishable little claster ("Rhyme time", "Common bonds", "Science") contains the themes with rare words and little proportion of proper names. **Beware them, stranger!**
+
+What about the correlation? It is hard to say: the coefficient is only 0.6 (r^2^ = 0.36). However, the presence of clasterization signals that some dependencies may be settled here and a slight correlation between frequency of words constituting the questions and the proportion of proper names in answers may work across the Jeopardy's categories.
+
+```{r}
+cor.test(jeos$Mean_ratio, jeos$Med_freq, method="pearson")
+```
